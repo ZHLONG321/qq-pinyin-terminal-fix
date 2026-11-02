@@ -1,0 +1,37 @@
+# 本机的截图、排查记录、文件备份和工作说明
+/tmp/
+/AGENTS.md
+
+# 编译出来的文件，以及本机的 Python 环境和缓存
+/dist/
+/build/
+__pycache__/
+*.py[cod]
+.venv/
+
+# 分析软件保存的数据，以及编译时产生的中间文件
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.dmp
+*.obj
+*.pdb
+*.lib
+*.exp
+
+# 输入法文件、程序、动态链接库和压缩包；本仓库提交它们的源码
+*.ime
+*.dll
+*.exe
+*.zip
+
+# 本机编辑器配置与凭据
+.vscode/
+.idea/
+.env
+.env.*
+!.env.example

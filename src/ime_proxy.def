@@ -1,0 +1,20 @@
+LIBRARY "QQPinyin.ime"
+EXPORTS
+    ImeFreeEnv @1
+    ImeGetEnv @2
+    ImeSetCompositionString @3
+    ImeConfigure @4
+    ImeConversionList @5
+    ImeDestroy @6
+    ImeEnumRegisterWord @7
+    ImeEscape @8
+    ImeExtension @9
+    ImeGetRegisterWordStyle @10
+    ImeInquire @11
+    ImeProcessKey @12
+    ImeRegisterWord @13
+    ImeSelect @14
+    ImeSetActiveContext @15
+    ImeToAsciiEx @16
+    ImeUnregisterWord @17
+    NotifyIME @18

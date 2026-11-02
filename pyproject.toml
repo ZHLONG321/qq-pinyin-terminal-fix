@@ -1,0 +1,6 @@
+[project]
+name = "qq-pinyin-terminal-fix"
+version = "0.1.0"
+description = "修复 QQ 拼音在 Windows Terminal 中不显示候选框的问题"
+requires-python = ">=3.11"
+dependencies = []
