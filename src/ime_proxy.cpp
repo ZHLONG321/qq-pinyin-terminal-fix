@@ -3,12 +3,16 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include "qq_layout.h"
+#include <exception>
+#include <utility>
 
 // 原引擎通过完整路径加载；所有初始化都发生在导出函数被调用时。
 static HMODULE self_module;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static FARPROC exports[18];
 static unsigned char* tsf_base;
+static QqLayout* layout;
 static constexpr const char* names[] = {
     "ImeFreeEnv", "ImeGetEnv", "ImeSetCompositionString", "ImeConfigure",
     "ImeConversionList", "ImeDestroy", "ImeEnumRegisterWord", "ImeEscape",
@@ -16,27 +20,6 @@ static constexpr const char* names[] = {
     "ImeRegisterWord", "ImeSelect", "ImeSetActiveContext", "ImeToAsciiEx",
     "ImeUnregisterWord", "NotifyIME"
 };
-
-static bool matches_layout(HMODULE module) {
-    // 检查实际判断标志的指令，而不是按整个文件的校验值限定版本。
-    // test byte ptr [rbx+0x3b9c], 0x40；0x3b9c 即保存标志的位置。
-    __try {
-        auto base = reinterpret_cast<unsigned char*>(module);
-        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return false;
-        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-            nt->OptionalHeader.SizeOfImage < 0x2a340) return false;
-        constexpr unsigned char instruction[] = {0xf6, 0x83, 0x9c, 0x3b, 0, 0, 0x40};
-        constexpr uintptr_t sites[] = {0x5b5c, 0xa327, 0xa4ad, 0xafbd};
-        for (auto site : sites)
-            if (memcmp(base + site, instruction, sizeof(instruction))) return false;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 
 static BOOL CALLBACK initialize(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t path[32768];
@@ -67,36 +50,49 @@ static BOOL CALLBACK initialize(PINIT_ONCE, PVOID, PVOID*) {
     name = wcsrchr(path, L'\\');
     if (!name || _wcsicmp(name + 1, L"WindowsTerminal.exe")) return TRUE;
     HMODULE tsf = GetModuleHandleW(L"QQPinyinTSF.dll");
-    if (tsf && matches_layout(tsf)) {
-        tsf_base = reinterpret_cast<unsigned char*>(tsf);
-    } else {
-        OutputDebugStringW(L"QQ terminal fix: TSF layout differs; forwarding without applying fix\n");
+    if (tsf) {
+        try {
+            auto found = find_qq_layout(QqImage::from_module(tsf));
+            layout = new QqLayout(std::move(found));
+            tsf_base = reinterpret_cast<unsigned char*>(tsf);
+        } catch (const std::exception&) {
+            OutputDebugStringW(L"QQ terminal fix: cannot identify TSF layout; forwarding without applying fix\n");
+        }
     }
     return TRUE;
 }
 
-static void fix_current_thread() {
-    if (!tsf_base) return;
-    // TlsGetValue 读取当前调用线程，与 TSF 保存对象时使用的线程一致。
+static unsigned char* current_service(DWORD index) {
+    // 每个候选线程索引都要由整组接口表确认，不能凭非空指针判断。
     __try {
-        DWORD index = *reinterpret_cast<DWORD*>(tsf_base + 0x2a33c);
         auto service = static_cast<unsigned char*>(TlsGetValue(index));
-        if (!service || reinterpret_cast<uintptr_t>(service) % alignof(void*)) return;
-        if (*reinterpret_cast<void**>(service) != tsf_base + 0x21cc8) return;
-        constexpr uintptr_t expected[] = {
-            0x21c40, 0x21c70, 0x21ca0, 0x21cc8, 0x21d00,
-            0x21d30, 0x21d68, 0x21db8, 0x21de0, 0x21e10
-        };
-        unsigned seen = 0;
-        for (size_t i = 0; i < ARRAYSIZE(expected); ++i) {
-            auto table = reinterpret_cast<uintptr_t*>(service)[i];
-            unsigned match = 0;
-            for (size_t j = 0; j < ARRAYSIZE(expected); ++j)
-                if (table == reinterpret_cast<uintptr_t>(tsf_base) + expected[j]) match = 1u << j;
-            if (!match || (seen & match)) return;
-            seen |= match;
+        if (!service || reinterpret_cast<uintptr_t>(service) % alignof(void*)) return nullptr;
+        auto table = *reinterpret_cast<void**>(service);
+        for (const auto& candidate : layout->tables) {
+            if (table != tsf_base + candidate.rva) continue;
+            auto object = service - candidate.object_offset;
+            bool valid = true;
+            for (const auto& expected : layout->tables)
+                if (*reinterpret_cast<void**>(object + expected.object_offset) != tsf_base + expected.rva) valid = false;
+            if (valid) return object;
         }
-        auto flags = reinterpret_cast<volatile LONG*>(service + 15260);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
+static void fix_current_thread() {
+    if (!tsf_base || !layout) return;
+    __try {
+        unsigned char* service = nullptr;
+        for (auto rva : layout->tls_indices) {
+            DWORD index = *reinterpret_cast<DWORD*>(tsf_base + rva);
+            auto candidate = current_service(index);
+            if (!candidate) continue;
+            if (service && service != candidate) return;
+            service = candidate;
+        }
+        if (!service) return;
+        auto flags = reinterpret_cast<volatile LONG*>(service + layout->flags_offset);
         MEMORY_BASIC_INFORMATION memory{};
         if (!VirtualQuery(const_cast<LONG*>(flags), &memory, sizeof(memory))) return;
         if (memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return;

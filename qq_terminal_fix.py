@@ -8,15 +8,30 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
-from typing import cast
+from typing import TypedDict, cast
 
 
 SESSION = os.environ.get('CODEX_THREAD_ID') or 'manual-memory-fix'
 CONSOLE = 0x40
-TLS_INDEX_RVA = 0x2a33c
-SERVICE_VTABLE_RVA = 0x21cc8
-FLAGS_OFFSET = 15260
+
+
+class ObjectTable(TypedDict):
+    object_offset: int
+    rva: int
+
+
+class InstructionCheck(TypedDict):
+    rva: int
+    bytes: str
+
+
+class Layout(TypedDict):
+    flags_offset: int
+    tls_indices: list[int]
+    tables: list[ObjectTable]
+    checks: list[InstructionCheck]
 
 
 class TEB(c.Structure):
@@ -38,6 +53,7 @@ class Target:
     def __init__(self, pid, tid, writable):
         self.pid = pid
         self.tid = tid
+        self.layout_cache: tuple[str, Layout] | None = None
         self.k = c.WinDLL('kernel32', use_last_error=True)
         self.p = c.WinDLL('psapi', use_last_error=True)
         self.n = c.WinDLL('ntdll', use_last_error=True)
@@ -71,6 +87,19 @@ class Target:
     def pointer(self, address):
         return struct.unpack('<Q', self.read(address, 8))[0]
 
+    def layout_for(self, path: Path, fingerprint: str) -> Layout:
+        if self.layout_cache is not None and self.layout_cache[0] == fingerprint:
+            return self.layout_cache[1]
+        scanner = Path(__file__).resolve().parent / 'dist/x64/qq_layout.exe'
+        if not scanner.is_file():
+            raise RuntimeError('找不到自动查找工具，请先运行 uv run build.py。')
+        result = subprocess.run([str(scanner), str(path)], capture_output=True, encoding='utf-8')
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or '无法找到 QQ 拼音的候选框控制位置。')
+        layout = cast(Layout, json.loads(result.stdout))
+        self.layout_cache = fingerprint, layout
+        return layout
+
     def resolve(self):
         image = c.create_unicode_buffer(32768)
         length = w.DWORD(len(image))
@@ -90,6 +119,7 @@ class Target:
             raise RuntimeError('模块列表没有读全。')
         module_base = None
         module_digest = ''
+        layout: Layout | None = None
         for module in modules[:needed.value // c.sizeof(w.HMODULE)]:
             path = c.create_unicode_buffer(32768)
             if not self.p.GetModuleFileNameExW(self.process, module, path, len(path)):
@@ -101,14 +131,15 @@ class Target:
                 if struct.unpack_from('<H', data, pe + 4)[0] != 0x8664:
                     raise RuntimeError('请使用 64 位 QQ 拼音组件。')
                 module_base = module
+                layout = self.layout_for(Path(path.value), module_digest)
                 break
-        if module_base is None:
+        if module_base is None or layout is None:
             raise RuntimeError('这个进程还没有加载 QQ 拼音。先在目标窗口选中 QQ 拼音。')
-        # 直接核对操作标志的指令，不按整个 QQ 文件的校验值限定版本。
-        instruction = bytes.fromhex('f6 83 9c 3b 00 00 40')
-        if any(self.read(module_base + rva, len(instruction)) != instruction
-               for rva in (0x5b5c, 0xa327, 0xa4ad, 0xafbd)):
-            raise RuntimeError('QQ 拼音中控制候选框的位置与本工具识别的结构不同。')
+        # 用本次扫描找到的指令核对正在运行的模块，防止磁盘文件已更新。
+        for check in layout['checks']:
+            instruction = bytes.fromhex(check['bytes'])
+            if self.read(module_base + check['rva'], len(instruction)) != instruction:
+                raise RuntimeError('正在运行的 QQ 拼音与磁盘文件不同，请重新打开 Terminal。')
         thread = self.k.OpenThread(0x40, False, self.tid)
         if not thread:
             raise c.WinError(c.get_last_error())
@@ -119,27 +150,38 @@ class Target:
                 raise RuntimeError('线程不属于指定的 Terminal 进程，或线程状态无法读取。')
         finally:
             self.k.CloseHandle(thread)
-        index = struct.unpack('<I', self.read(module_base + TLS_INDEX_RVA, 4))[0]
-        if index < 64:
-            slot = info.TebBaseAddress + TEB.TlsSlots.offset + index * 8
-        else:
-            expansion = self.pointer(info.TebBaseAddress + TEB.TlsExpansionSlots.offset)
-            if not expansion:
-                raise RuntimeError('目标线程的 QQ 拼音状态尚未建立。')
-            slot = expansion + (index - 64) * 8
-        service = self.pointer(slot)
-        if not service or self.pointer(service) != module_base + SERVICE_VTABLE_RVA:
-            raise RuntimeError('QQ 拼音对象与已分析的布局不一致。')
-        # 这些接口表来自该文件的 CTextService 构造函数及 RTTI。
-        expected_tables = {0x21c40, 0x21c70, 0x21ca0, 0x21cc8, 0x21d00,
-                           0x21d30, 0x21d68, 0x21db8, 0x21de0, 0x21e10}
-        actual_tables = {self.pointer(service + offset) - module_base for offset in range(0, 80, 8)}
-        if actual_tables != expected_tables:
-            raise RuntimeError('QQ 拼音对象的相邻接口不匹配。')
-        flags = struct.unpack('<I', self.read(service + FLAGS_OFFSET, 4))[0]
+        found: set[int] = set()
+        for index_rva in layout['tls_indices']:
+            index = struct.unpack('<I', self.read(module_base + index_rva, 4))[0]
+            if index < 64:
+                slot = info.TebBaseAddress + TEB.TlsSlots.offset + index * 8
+            else:
+                expansion = self.pointer(info.TebBaseAddress + TEB.TlsExpansionSlots.offset)
+                if not expansion:
+                    continue
+                slot = expansion + (index - 64) * 8
+            try:
+                pointer = self.pointer(slot)
+                if not pointer or pointer % 8:
+                    continue
+                table_pointer = self.pointer(pointer)
+                for table in layout['tables']:
+                    if table_pointer != module_base + table['rva']:
+                        continue
+                    candidate = pointer - table['object_offset']
+                    if all(self.pointer(candidate + other['object_offset']) == module_base + other['rva']
+                           for other in layout['tables']):
+                        found.add(candidate)
+            except OSError:
+                continue
+        if len(found) != 1:
+            raise RuntimeError('无法在目标线程中唯一找到 QQ 拼音对象，请先在目标窗口选中 QQ 拼音。')
+        service = found.pop()
+        flags_offset = layout['flags_offset']
+        flags = struct.unpack('<I', self.read(service + flags_offset, 4))[0]
         return {'pid': self.pid, 'tid': self.tid, 'process_created': birth,
                 'module_base': module_base, 'module_sha256': module_digest, 'service': service,
-                'flags_address': service + FLAGS_OFFSET, 'flags': flags}
+                'flags_address': service + flags_offset, 'flags': flags}
 
     def write_flags(self, state, expected, replacement):
         current = self.resolve()

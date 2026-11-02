@@ -1,4 +1,4 @@
-"""从源码构建 64 位 QQ 拼音代理。"""
+"""从源码构建 64 位 QQ 拼音代理和查找工具。"""
 
 import hashlib
 import os
@@ -62,12 +62,20 @@ def main() -> None:
         sdk / 'Lib' / sdk_version / name for name in ('ucrt/x64', 'um/x64')]]))
     staged = work / 'QQPinyin.ime'
     commands = [
+        [str(tools / 'cl.exe'), '/nologo', '/utf-8', '/W3', '/O2', '/MT', '/c',
+         '/Fo' + str(work / 'hde64.obj'), str(ROOT / 'third_party/hde64/hde64.c')],
+        [str(tools / 'cl.exe'), '/nologo', '/utf-8', '/std:c++17', '/W4', '/WX', '/O2', '/MT', '/EHsc', '/c',
+         '/Fo' + str(work / 'qq_layout.obj'), str(ROOT / 'src/qq_layout.cpp')],
         [str(tools / 'ml64.exe'), '/nologo', '/c', '/Fo' + str(work / 'ime_proxy_asm.obj'), str(ROOT / 'src/ime_proxy.asm')],
-        [str(tools / 'cl.exe'), '/nologo', '/utf-8', '/W4', '/WX', '/O2', '/MT', '/EHsc', '/LD',
+        [str(tools / 'cl.exe'), '/nologo', '/utf-8', '/std:c++17', '/W4', '/WX', '/O2', '/MT', '/EHsc', '/LD',
          '/Fo' + str(work / 'ime_proxy.obj'), '/Fd' + str(work / 'ime_proxy.pdb'),
-         str(ROOT / 'src/ime_proxy.cpp'), str(work / 'ime_proxy_asm.obj'),
+         str(ROOT / 'src/ime_proxy.cpp'), str(work / 'ime_proxy_asm.obj'), str(work / 'qq_layout.obj'), str(work / 'hde64.obj'),
          '/link', '/DEF:' + str(ROOT / 'src/ime_proxy.def'), '/OUT:' + str(staged),
          '/IMPLIB:' + str(work / 'ime_proxy.lib'), '/Brepro', '/DYNAMICBASE', '/NXCOMPAT'],
+        [str(tools / 'cl.exe'), '/nologo', '/utf-8', '/std:c++17', '/W4', '/WX', '/O2', '/MT', '/EHsc',
+         '/Fo' + str(work / 'layout_tool.obj'), '/Fe' + str(work / 'qq_layout.exe'),
+         str(ROOT / 'src/layout_tool.cpp'), str(work / 'qq_layout.obj'), str(work / 'hde64.obj'),
+         '/link', '/Brepro', '/DYNAMICBASE', '/NXCOMPAT'],
     ]
     print(f'MSVC {msvc.name}，Windows SDK {sdk_version}', flush=True)
     for command in commands:
@@ -76,6 +84,8 @@ def main() -> None:
     output = ROOT / 'dist/x64/QQPinyin.ime'
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(staged, output)
+    shutil.copyfile(work / 'qq_layout.exe', output.parent / 'qq_layout.exe')
+    shutil.copyfile(ROOT / 'third_party/hde64/LICENSE.txt', output.parent / 'HDE64-LICENSE.txt')
     print(f'构建完成：{output.relative_to(ROOT)}', flush=True)
     print(f'SHA-256：{hashlib.sha256(output.read_bytes()).hexdigest()}', flush=True)
 
